@@ -1,0 +1,7 @@
+python-binance
+anthropic
+requests
+pandas
+numpy
+python-dotenv
+schedule
