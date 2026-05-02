@@ -1,4 +1,7 @@
+import json
+import os
 import sys
+import threading
 import time
 from datetime import datetime, date, timezone
 
@@ -13,6 +16,7 @@ import ai_engine
 import executor
 import logger as bot_logger
 import telegram_notifier
+from api_server import app as flask_app
 
 BOT_NAME = "Binance AI Trading Bot"
 _SEP = "=" * 62
@@ -25,6 +29,10 @@ daily_stats: dict = {}
 _last_data_package: dict | None = None
 _last_indicators: dict | None = None
 _current_day: date | None = None
+_uptime_start: str = ""
+_cycles_run: int = 0
+
+_STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "status.json")
 
 
 def _init_daily_stats(portfolio_value: float) -> dict:
@@ -136,8 +144,103 @@ def _send_daily_report() -> None:
         bot_logger.log_error(f"Daily Telegram report failed: {exc}", exc)
 
 
+def _write_status_json(
+    data_package: dict,
+    indicators_data: dict,
+    decision: dict,
+    portfolio: dict,
+) -> None:
+    try:
+        market = data_package.get("market", {})
+        fng = data_package.get("fear_and_greed", {})
+        gm = data_package.get("global_market", {})
+        balances = portfolio.get("balances", {})
+        total_usdt = portfolio.get("total_usdt", 0)
+
+        usdt_bal = balances.get("USDT", {})
+        usdt_available = usdt_bal.get("free", 0)
+
+        pnl_dollar = total_usdt - config.STARTING_CAPITAL
+        pnl_percent = (pnl_dollar / config.STARTING_CAPITAL * 100) if config.STARTING_CAPITAL else 0.0
+
+        holdings = sorted(
+            [
+                {
+                    "symbol": asset,
+                    "value_usd": round(b.get("value_usdt", 0), 2),
+                    "percentage": b.get("portfolio_pct", 0),
+                }
+                for asset, b in balances.items()
+                if asset != "USDT"
+            ],
+            key=lambda x: x["value_usd"],
+            reverse=True,
+        )
+
+        def _price(sym: str):
+            return market.get(sym, {}).get("price")
+
+        def _rsi(sym: str):
+            return indicators_data.get(sym, {}).get("rsi", {}).get("value")
+
+        def _macd(sym: str):
+            return indicators_data.get(sym, {}).get("macd", {}).get("crossover")
+
+        first_trade = (decision.get("trades") or [{}])[0]
+
+        status_data = {
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "bot_running": True,
+            "dry_run": config.DRY_RUN,
+            "trading_mode": config.TRADING_MODE,
+            "cycles_run": _cycles_run,
+            "uptime_start": _uptime_start,
+            "last_decision": {
+                "action": first_trade.get("action", "HOLD"),
+                "coin": first_trade.get("coin", "NONE"),
+                "confidence": first_trade.get("confidence", "LOW"),
+                "reason": first_trade.get("reason", ""),
+                "market_summary": decision.get("market_summary", ""),
+            },
+            "portfolio": {
+                "total_value": round(total_usdt, 2),
+                "starting_capital": config.STARTING_CAPITAL,
+                "pnl_dollar": round(pnl_dollar, 2),
+                "pnl_percent": round(pnl_percent, 4),
+                "usdt_available": round(usdt_available, 2),
+                "top_holdings": holdings[:10],
+            },
+            "market": {
+                "fear_greed_score": fng.get("current_value"),
+                "fear_greed_label": fng.get("current_label"),
+                "top_opportunity": decision.get("top_opportunity"),
+                "top_opportunity_score": decision.get("top_opportunity_score", 0),
+                "btc_dominance": gm.get("btc_dominance"),
+                "market_breadth": gm.get("market_breadth"),
+                "btc_price": _price("BTCUSDT"),
+                "eth_price": _price("ETHUSDT"),
+                "sol_price": _price("SOLUSDT"),
+                "bnb_price": _price("BNBUSDT"),
+                "btc_rsi": _rsi("BTCUSDT"),
+                "eth_rsi": _rsi("ETHUSDT"),
+                "sol_rsi": _rsi("SOLUSDT"),
+                "bnb_rsi": _rsi("BNBUSDT"),
+                "btc_macd": _macd("BTCUSDT"),
+                "eth_macd": _macd("ETHUSDT"),
+                "sol_macd": _macd("SOLUSDT"),
+                "bnb_macd": _macd("BNBUSDT"),
+            },
+        }
+
+        with open(_STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump(status_data, f, indent=2)
+
+    except Exception as exc:
+        bot_logger.log_error(f"Failed to write status.json: {exc}", exc)
+
+
 def _run_cycle() -> None:
-    global _last_data_package, _last_indicators, decisions_history, daily_stats
+    global _last_data_package, _last_indicators, decisions_history, daily_stats, _cycles_run
 
     try:
         # 1. Fetch all data
@@ -287,6 +390,10 @@ def _run_cycle() -> None:
                     start_p[short] = price
                 daily_stats.setdefault("coin_current_prices", {})[short] = price
 
+        # 10. Write status.json for the API server
+        _cycles_run += 1
+        _write_status_json(data_package, indicators_data, decision, portfolio)
+
         # Console heartbeat
         fng_val = fng.get("current_value", "N/A")
         now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -305,7 +412,7 @@ def _run_cycle() -> None:
 
 
 def main() -> None:
-    global daily_stats, _current_day
+    global daily_stats, _current_day, _uptime_start
 
     required_attrs = [
         "BINANCE_API_KEY", "ANTHROPIC_API_KEY",
@@ -316,6 +423,16 @@ def main() -> None:
     if missing:
         print(f"[FATAL] Config missing: {', '.join(missing)}")
         sys.exit(1)
+
+    _uptime_start = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    api_thread = threading.Thread(
+        target=lambda: flask_app.run(
+            host="0.0.0.0", port=8080, debug=False, use_reloader=False
+        )
+    )
+    api_thread.daemon = True
+    api_thread.start()
 
     _print_banner()
     _test_connection()

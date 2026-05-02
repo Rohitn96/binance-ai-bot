@@ -283,11 +283,17 @@ def get_decision(data_package: dict, indicators_data: dict) -> dict:
             messages=[{"role": "user", "content": prompt}],
         )
         raw = message.content[0].text.strip()
-        return _parse_response(raw)
-
+        result = _parse_response(raw)
     except json.JSONDecodeError as exc:
-        return {**_HOLD_RESPONSE, "trades": [{**_HOLD_RESPONSE["trades"][0], "reason": f"JSON parse error: {exc}"}]}
+        result = {**_HOLD_RESPONSE, "trades": [{**_HOLD_RESPONSE["trades"][0], "reason": f"JSON parse error: {exc}"}]}
     except anthropic.APIError as exc:
-        return {**_HOLD_RESPONSE, "trades": [{**_HOLD_RESPONSE["trades"][0], "reason": f"Anthropic API error: {exc}"}]}
+        result = {**_HOLD_RESPONSE, "trades": [{**_HOLD_RESPONSE["trades"][0], "reason": f"Anthropic API error: {exc}"}]}
     except Exception as exc:
-        return {**_HOLD_RESPONSE, "trades": [{**_HOLD_RESPONSE["trades"][0], "reason": f"AI engine error: {exc}"}]}
+        result = {**_HOLD_RESPONSE, "trades": [{**_HOLD_RESPONSE["trades"][0], "reason": f"AI engine error: {exc}"}]}
+
+    top_opp = result.get("top_opportunity", "NONE")
+    result["top_opportunity_score"] = next(
+        (rc["score"] for rc in ranked if rc["symbol"].replace("USDT", "") == top_opp),
+        0,
+    )
+    return result
