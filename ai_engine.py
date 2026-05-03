@@ -5,6 +5,8 @@ import anthropic
 import config
 from indicators import rank_top20
 
+_STABLECOINS = {"USDC", "USDT", "TUSD", "FDUSD", "DAI", "BUSD", "USDP"}
+
 _HOLD_RESPONSE = {
     "trades": [
         {
@@ -162,7 +164,7 @@ def _build_prompt(
     rules_section = """TRADING RULES:
 - Max 5 coins held simultaneously
 - Keep minimum 15% as USDT reserve
-- Max 3 trades this cycle
+- Max 2 trades this cycle
 - F&G below 15: HOLD only, no buys
 - F&G 15-25: max 8% per trade
 - F&G 25-40: max 15% per trade
@@ -171,7 +173,12 @@ def _build_prompt(
 - RSI above 72: strong sell regardless of F&G
 - Trending coin with score above 60: prioritise buying
 - Held coin in bottom 5 of ranking: consider selling
-- Never hold 0 positions, keep at least 1 coin"""
+- Never hold 0 positions, keep at least 1 coin
+
+IMPORTANT: HOLD is a valid and encouraged decision.
+You should HOLD at least 30% of the time.
+Only trade when signals are very clear and strong.
+Do not force a trade every cycle."""
 
     return f"""{global_section}
 
@@ -201,7 +208,7 @@ Respond in this exact JSON only, no other text:
   "top_opportunity": "best coin symbol right now"
 }}
 
-Maximum 3 items in trades array."""
+Maximum 2 items in trades array."""
 
 
 def _parse_response(raw: str) -> dict:
@@ -222,7 +229,7 @@ def _parse_response(raw: str) -> dict:
 
     required_trade = {"action", "coin", "percentage", "confidence", "reason"}
     normalized = []
-    for trade in raw_trades[:3]:
+    for trade in raw_trades[:2]:
         if not isinstance(trade, dict) or not required_trade.issubset(trade.keys()):
             continue
         trade["action"] = str(trade["action"]).upper()
@@ -249,6 +256,41 @@ def _parse_response(raw: str) -> dict:
         "portfolio_strategy": str(response.get("portfolio_strategy", "Hold current positions.")),
         "top_opportunity": str(response.get("top_opportunity", "NONE")).upper(),
     }
+
+
+def _filter_aggressive_trades(
+    trades: list[dict], ranked: list[dict], indicators: dict
+) -> list[dict]:
+    """Drop BUY trades that are stablecoins, low-score, or overbought."""
+    filtered = []
+    for trade in trades:
+        if trade["action"] != "BUY":
+            filtered.append(trade)
+            continue
+
+        coin = trade["coin"]
+
+        # 1. Never buy stablecoins
+        if coin in _STABLECOINS:
+            continue
+
+        # 2. Only buy if opportunity score > 60
+        score = next(
+            (rc["score"] for rc in ranked if rc["symbol"].replace("USDT", "") == coin),
+            0,
+        )
+        if score <= 60:
+            continue
+
+        # 3. Never buy if RSI >= 68
+        ind = indicators.get(coin + "USDT", indicators.get(coin, {}))
+        rsi_val = ind.get("rsi", {}).get("value") if "error" not in ind else None
+        if rsi_val is not None and rsi_val >= 68:
+            continue
+
+        filtered.append(trade)
+
+    return filtered or list(_HOLD_RESPONSE["trades"])
 
 
 def get_decision(data_package: dict, indicators_data: dict) -> dict:
@@ -284,6 +326,7 @@ def get_decision(data_package: dict, indicators_data: dict) -> dict:
         )
         raw = message.content[0].text.strip()
         result = _parse_response(raw)
+        result["trades"] = _filter_aggressive_trades(result["trades"], ranked, indicators_data)
     except json.JSONDecodeError as exc:
         result = {**_HOLD_RESPONSE, "trades": [{**_HOLD_RESPONSE["trades"][0], "reason": f"JSON parse error: {exc}"}]}
     except anthropic.APIError as exc:

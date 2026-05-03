@@ -42,8 +42,8 @@ MIN_USDT_RESERVE: float = float(os.getenv("MIN_USDT_RESERVE", "20"))
 
 # Dynamic top-20 trading system settings
 MAX_COINS_HELD: int = 5
-MIN_USDT_RESERVE_PCT: float = 15.0
-MAX_TRADES_PER_CYCLE: int = 3
+MIN_USDT_RESERVE_PCT: float = 2.0
+MAX_TRADES_PER_CYCLE: int = 2
 TOP_COINS_TO_SCAN: int = 20
 
 # Optional — bot runs fine without these; Telegram messages are silently skipped
